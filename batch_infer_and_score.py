@@ -20,6 +20,8 @@ Example:
     --output-dir ./analyze_run \\
     --which all \\
     --gt-classes pass
+
+  # Same split as training: --which train | --which val | --which all (train+val)
 """
 
 from __future__ import annotations
@@ -153,7 +155,12 @@ def main() -> None:
         type=str,
         choices=("all", "train", "val"),
         default="all",
-        help="Which stems to run: all clips, or only the train or val split (same logic as train.py).",
+        help=(
+            "Which clips to run: "
+            "'train' = training split only, 'val' = validation split only, "
+            "'all' = train + val (full set used when training with validation; default). "
+            "Split matches train.py (validation.split_ratio, validation.seed)."
+        ),
     )
     parser.add_argument(
         "--environments",

@@ -95,6 +95,9 @@ training:
   device: cuda
 
 validation:
+  # ~split_ratio of clips go to validation (not "the last" clips in folder order).
+  # Stems are sorted alphabetically, then shuffled with ``seed``; the first n_val shuffled
+  # names are validation, the rest training. Reproducible if seed and clip set are unchanged.
   enabled: true
   split_ratio: 0.2
   seed: 42

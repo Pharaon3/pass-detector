@@ -22,6 +22,9 @@ Validation / early stopping: see ``validation`` and ``early_stopping`` in ``conf
 When ``early_stopping.save_best`` is true, the best epoch (by any monitored metric when
 ``monitors`` is set) is written to ``early_stopping.best_checkpoint_path`` in addition to
 per-epoch and ``last.pt`` checkpoints.
+
+Train/val stem lists: use ``--export-split DIR`` to write ``train_stems.txt`` and ``val_stems.txt``
+(see ``_deterministic_train_val_stems`` and ``validation`` keys in config).
 """
 
 from __future__ import annotations
@@ -254,6 +257,16 @@ def _deterministic_train_val_stems(
     return train_stems, val_stems
 
 
+def write_train_val_stem_lists(out_dir: Path, train_stems: List[str], val_stems: List[str]) -> Tuple[Path, Path]:
+    """Write one stem per line (same convention as ``--split`` / ``train.txt``)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train_path = out_dir / "train_stems.txt"
+    val_path = out_dir / "val_stems.txt"
+    train_path.write_text("\n".join(train_stems) + ("\n" if train_stems else ""), encoding="utf-8")
+    val_path.write_text("\n".join(val_stems) + ("\n" if val_stems else ""), encoding="utf-8")
+    return train_path, val_path
+
+
 def _print_validation_per_class_table(class_names: List[str], metrics: Dict[str, Any]) -> None:
     precs = metrics.get("val_per_class_precision")
     recs = metrics.get("val_per_class_recall")
@@ -420,6 +433,16 @@ def main() -> None:
             "Omit to use config.yaml training_environments (null = all)."
         ),
     )
+    parser.add_argument(
+        "--export-split",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "If validation is enabled, write train_stems.txt and val_stems.txt under this directory "
+            "(one clip stem per line; split is deterministic from validation.seed and split_ratio)."
+        ),
+    )
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -475,6 +498,11 @@ def main() -> None:
                 "validation split produced an empty validation set. "
                 "Increase the number of clips or adjust validation.split_ratio."
             )
+        export_dir = args.export_split
+        if export_dir:
+            tp, vp = write_train_val_stem_lists(Path(export_dir), train_stems, val_stems)
+            print(f"Wrote train/val stem lists: {tp.resolve()} ({len(train_stems)} stems)")
+            print(f"                             {vp.resolve()} ({len(val_stems)} stems)")
         val_ds = SoccerClipDataset(
             args.data_root,
             cfg,

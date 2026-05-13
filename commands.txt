@@ -13,12 +13,15 @@ CUDA_VISIBLE_DEVICES=0 python3 train.py --data_root dataset --split train.txt --
 
 =============Infer=====================
 CUDA_VISIBLE_DEVICES=0 python3 infer.py \
---video "./dataset/private/495678ea48ae40cc957bbe03974dbf/495678ea48ae40cc957bbe03974dbf.mp4" \
---checkpoint "./checkpoints/pass.pt" \
+--video "./dataset/private/7affb67661e84d058f5de9becf3ece/7affb67661e84d058f5de9becf3ece.mp4" \
+--checkpoint "./checkpoints/best_model.pt" \
 --output "./predictions.json"
 
 # Compare predictions to label JSON (same class, |Δt| < 1s; mean confidence)
-python3 score_events.py --predicted ./predictions.json --ground-truth "./dataset/private/495678ea48ae40cc957bbe03974dbf/495678ea48ae40cc957bbe03974dbf.json" --gt-classes pass
+python3 score_events.py --predicted ./predictions.json --ground-truth "./dataset/private/7affb67661e84d058f5de9becf3ece/7affb67661e84d058f5de9becf3ece.json" --gt-classes pass
+
+# Batch: infer every train+val clip (same discovery/split as training), score vs labels, write analyze_run/
+python3 batch_infer_and_score.py --data_root dataset/private --video_dir . --labels_dir . --checkpoint ./checkpoints/best_model.pt --output-dir ./analyze_run --which all --gt-classes pass
 
 cd ssh/
 ssh -i temporary.pem ubuntu@94.101.98.189

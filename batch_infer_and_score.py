@@ -11,6 +11,8 @@ Outputs:
   - ``<output_dir>/per_clip.jsonl`` — one JSON object per line with scores per stem
   - ``<output_dir>/summary.json`` — rolled-up totals and optional by-split breakdown
 
+Shows a tqdm clip progress bar by default (``pip install tqdm``). Use ``--no-progress-bar`` to disable.
+
 Example:
   python batch_infer_and_score.py \\
     --data_root dataset/private --video_dir . --labels_dir . \\
@@ -26,11 +28,17 @@ import argparse
 import json
 import random
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import yaml
+
+try:
+    from tqdm.auto import tqdm as tqdm_auto
+except ImportError:  # pragma: no cover
+    tqdm_auto = None  # type: ignore[misc, assignment]
 
 _PKG = Path(__file__).resolve().parent
 if str(_PKG) not in sys.path:
@@ -189,6 +197,11 @@ def main() -> None:
         action="store_true",
         help="Do not merge repo config.yaml infer keys when --config is omitted (infer.py merges by default).",
     )
+    parser.add_argument(
+        "--no-progress-bar",
+        action="store_true",
+        help="Disable tqdm clip progress bar (default: show bar if tqdm is installed).",
+    )
     args = parser.parse_args()
 
     ckpt = load_checkpoint(args.checkpoint, map_location="cpu")
@@ -301,80 +314,115 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    with jsonl_path.open("w", encoding="utf-8") as jf:
-        for stem, split_tag in work:
-            vp, lp = stem_to_paths[stem]
-            try:
-                events = _infer_one_clip(model, device, vpre, pp_cfg, activation, vp)
-            except Exception as exc:  # pragma: no cover
+    use_pbar = not args.no_progress_bar and tqdm_auto is not None
+    if not args.no_progress_bar and tqdm_auto is None:
+        print(
+            "tqdm is not installed; run `pip install tqdm` for a clip progress bar.",
+            file=sys.stderr,
+        )
+
+    pbar_ctx: Any
+    if use_pbar:
+        pbar_ctx = tqdm_auto(
+            work,
+            desc="Batch infer+score",
+            total=len(work),
+            unit="clip",
+            dynamic_ncols=True,
+            leave=True,
+        )
+    else:
+        pbar_ctx = nullcontext(work)
+
+    with pbar_ctx as iterator:
+        with jsonl_path.open("w", encoding="utf-8") as jf:
+            for stem, split_tag in iterator:
+                vp, lp = stem_to_paths[stem]
+                try:
+                    events = _infer_one_clip(model, device, vpre, pp_cfg, activation, vp)
+                except Exception as exc:  # pragma: no cover
+                    row = {
+                        "stem": stem,
+                        "split": split_tag,
+                        "video": str(vp),
+                        "label": str(lp),
+                        "error": repr(exc),
+                    }
+                    jf.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    msg = f"FAIL {stem}: {exc}"
+                    if use_pbar:
+                        tqdm_auto.write(msg, file=sys.stderr)
+                    else:
+                        print(msg, file=sys.stderr)
+                    continue
+
+                if args.save_predictions:
+                    pj = pred_dir / f"{stem}.json"
+                    pj.write_text(
+                        json.dumps(events, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+                gt_events = load_ground_truth_events(lp)
+                res = match_prediction_to_gt(
+                    events,
+                    gt_events,
+                    tolerance_sec=float(args.score_tolerance),
+                    gt_class_filter=gt_filter,
+                )
+
+                n_gt_scored = 0
+                for ev in gt_events:
+                    parsed = _normalize_gt_event(ev)
+                    if parsed is None:
+                        continue
+                    if gt_filter is not None and parsed[1] not in gt_filter:
+                        continue
+                    n_gt_scored += 1
+
                 row = {
                     "stem": stem,
                     "split": split_tag,
                     "video": str(vp),
                     "label": str(lp),
-                    "error": repr(exc),
+                    "n_pred_events": len(events),
+                    "n_gt_events_scored": n_gt_scored,
+                    "matched": res.n_matched,
+                    "pred_only": res.n_pred_only,
+                    "gt_only": res.n_gt_only,
+                    "mean_conf_all": res.mean_conf_all,
+                    "mean_conf_matched": res.mean_conf_matched,
                 }
                 jf.write(json.dumps(row, ensure_ascii=False) + "\n")
-                print(f"FAIL {stem}: {exc}", file=sys.stderr)
-                continue
 
-            if args.save_predictions:
-                pj = pred_dir / f"{stem}.json"
-                pj.write_text(
-                    json.dumps(events, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
+                totals["n_clips"] += 1
+                totals["n_pred_events"] += len(events)
+                totals["n_gt_events_scored"] += n_gt_scored
+                totals["matched"] += res.n_matched
+                totals["pred_only"] += res.n_pred_only
+                totals["gt_only"] += res.n_gt_only
+                if res.mean_conf_all is not None and len(events) > 0:
+                    totals["sum_conf_all"] += float(res.mean_conf_all) * len(events)
+                    totals["n_conf_all"] += len(events)
+                if res.mean_conf_matched is not None and res.n_matched > 0:
+                    totals["sum_conf_matched"] += float(res.mean_conf_matched) * res.n_matched
+                    totals["n_conf_matched"] += res.n_matched
+
+                bs = by_split.setdefault(
+                    split_tag, {"n_clips": 0, "matched": 0, "pred_only": 0, "gt_only": 0}
                 )
+                bs["n_clips"] += 1
+                bs["matched"] += res.n_matched
+                bs["pred_only"] += res.n_pred_only
+                bs["gt_only"] += res.n_gt_only
 
-            gt_events = load_ground_truth_events(lp)
-            res = match_prediction_to_gt(
-                events,
-                gt_events,
-                tolerance_sec=float(args.score_tolerance),
-                gt_class_filter=gt_filter,
-            )
-
-            n_gt_scored = 0
-            for ev in gt_events:
-                parsed = _normalize_gt_event(ev)
-                if parsed is None:
-                    continue
-                if gt_filter is not None and parsed[1] not in gt_filter:
-                    continue
-                n_gt_scored += 1
-
-            row = {
-                "stem": stem,
-                "split": split_tag,
-                "video": str(vp),
-                "label": str(lp),
-                "n_pred_events": len(events),
-                "n_gt_events_scored": n_gt_scored,
-                "matched": res.n_matched,
-                "pred_only": res.n_pred_only,
-                "gt_only": res.n_gt_only,
-                "mean_conf_all": res.mean_conf_all,
-                "mean_conf_matched": res.mean_conf_matched,
-            }
-            jf.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-            totals["n_clips"] += 1
-            totals["n_pred_events"] += len(events)
-            totals["n_gt_events_scored"] += n_gt_scored
-            totals["matched"] += res.n_matched
-            totals["pred_only"] += res.n_pred_only
-            totals["gt_only"] += res.n_gt_only
-            if res.mean_conf_all is not None and len(events) > 0:
-                totals["sum_conf_all"] += float(res.mean_conf_all) * len(events)
-                totals["n_conf_all"] += len(events)
-            if res.mean_conf_matched is not None and res.n_matched > 0:
-                totals["sum_conf_matched"] += float(res.mean_conf_matched) * res.n_matched
-                totals["n_conf_matched"] += res.n_matched
-
-            bs = by_split.setdefault(split_tag, {"n_clips": 0, "matched": 0, "pred_only": 0, "gt_only": 0})
-            bs["n_clips"] += 1
-            bs["matched"] += res.n_matched
-            bs["pred_only"] += res.n_pred_only
-            bs["gt_only"] += res.n_gt_only
+                if use_pbar:
+                    iterator.set_postfix(
+                        tag=split_tag,
+                        match=res.n_matched,
+                        pred=len(events),
+                        stem=stem[:20],
+                    )
 
     mean_conf_all = totals["sum_conf_all"] / totals["n_conf_all"] if totals["n_conf_all"] else None
     mean_conf_matched = (

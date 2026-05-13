@@ -34,7 +34,7 @@ postprocess:
     enabled: true
   thresholds:
     default: 0.5
-    pass: 0.45
+    pass: 0.7
   min_gap_sec:
     default: 0.1
     pass: 0.5

@@ -320,7 +320,10 @@ def main() -> None:
 
             if args.save_predictions:
                 pj = pred_dir / f"{stem}.json"
-                pj.write_text(json.dumps(events, indent=2), ensure_ascii=False)
+                pj.write_text(
+                    json.dumps(events, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
             gt_events = load_ground_truth_events(lp)
             res = match_prediction_to_gt(
@@ -398,7 +401,10 @@ def main() -> None:
         "by_split": by_split,
     }
     summary_path = out_root / "summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     print(f"Wrote {jsonl_path.resolve()} ({totals['n_clips']} clips)")
     print(f"Wrote {summary_path.resolve()}")

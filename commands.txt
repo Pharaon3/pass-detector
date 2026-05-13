@@ -1,0 +1,31 @@
+==============Train =======================
+CUDA_VISIBLE_DEVICES=0 python3 train.py --data_root dataset --split train.txt
+
+# Three demo clips: paired mp4 + json under dataset/examples/
+CUDA_VISIBLE_DEVICES=0 python3 train.py --data_root dataset --video_dir examples --labels_dir examples
+
+# Private clips: each subfolder is <stem>/<stem>.mp4 + <stem>/<stem>.json
+CUDA_VISIBLE_DEVICES=0 python3 train.py --data_root dataset/private --video_dir . --labels_dir .
+
+# Continue training (epochs saved_epoch+1 .. num_epochs in config.yaml)
+CUDA_VISIBLE_DEVICES=0 python3 train.py --data_root dataset --split train.txt --resume checkpoints/last.pt
+
+
+=============Infer=====================
+CUDA_VISIBLE_DEVICES=0 python3 infer.py \
+--video "./dataset/private/a5c2ba10499d4910b5fb3358d39f7c/a5c2ba10499d4910b5fb3358d39f7c.mp4" \
+--checkpoint "./checkpoints/last.pt" \
+--output "./predictions.json"
+
+cd ssh/
+ssh -i temporary.pem ubuntu@94.101.98.189
+cd soccernet/Video-classification--action-spotting-model/
+source venv/bin/activate
+
+tmux new -s train
+tmux attach -t train
+tmux ls
+tmux kill-session -t train
+
+================== Check GPU availibility ==========================
+python -c "import torch; print(torch.cuda.is_available())

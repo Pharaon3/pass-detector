@@ -1,0 +1,113 @@
+# Pass-only clip event detection. Label JSON may still list other action types;
+# training reads only events whose class is listed in class_names (see utils.labels.filter_events_to_config_classes).
+fps: 25
+clip_seconds: 30
+num_frames: 750
+
+num_classes: 1
+class_names:
+  - pass
+
+# Clip filtering by label JSON top-level "environment" (see dataset/private/*.json).
+# null or omitted = use clips from all environments.
+# Typical values: night, dry, snow, child
+training_environments:
+ - night
+# Example — train on night clips only:
+# training_environments:
+#   - night
+
+# multi_label: true -> sigmoid + BCE; false -> softmax + cross-entropy per frame
+multi_label: true
+activation: sigmoid
+
+# Legacy global postprocess (used when postprocess.* keys are omitted).
+threshold: 0.5
+min_event_gap_sec: 1.0
+
+# Optional nested postprocess (per-class thresholds, gaps, smoothing, peaks).
+postprocess:
+  smoothing:
+    enabled: true
+    window_frames: 5
+  peak_picking:
+    enabled: true
+  thresholds:
+    default: 0.5
+    pass: 0.45
+  min_gap_sec:
+    default: 0.1
+    pass: 0.5
+  top_k_per_class: null
+  top_k_total: 30
+
+# Half-width in frames when stamping positives around each annotated event time.
+label_radius_frames:
+  default: 10
+  pass: 13
+
+# strict_labels applies only to events retained after filtering to class_names.
+strict_labels: true
+
+loss:
+  type: bce
+  use_pos_weight: true
+  pos_weight_mode: auto
+  pos_weight_clip_max: 10.0
+  manual_pos_weight: null
+
+freeze_feature_extractor: true
+# Relative paths resolve from the soccer_event_model/ directory (where train.py lives).
+# Keras .h5 (e.g. TF dim_ordering) cannot be loaded into torchvision ResNet; if you point
+# to .h5, the backbone uses torchvision ImageNet weights and the file is kept for reference.
+# Use a PyTorch .pth / .pt state_dict to override backbone weights.
+resnet152_weights_path: weights/resnet152_weights_tf_dim_ordering_tf_kernels.h5
+
+# opencv | pyav — see utils/video.py
+video_backend: opencv
+
+temporal:
+  model_type: transformer
+  hidden_dim: 512
+  n_heads: 8
+  n_layers: 2
+  dim_feedforward: 2048
+  dropout: 0.1
+
+prediction_head:
+  hidden_dim: 256
+  dropout: 0.1
+
+training:
+  batch_size: 2
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  num_epochs: 100
+  # Video decode is CPU-heavy; use >0 workers so the GPU is not idle waiting on clips.
+  # Tune up (e.g. 4–8) if CPU cores and disk allow; 0 = all loading on the main process (slow).
+  num_workers: 10
+  checkpoint_dir: checkpoints
+  progress_bar: true
+  # log_each_step: true -> log paths after every batch (uses tqdm.write when progress_bar is on).
+  # If false, only log when step index is divisible by log_every (0-based).
+  log_each_step: true
+  log_every: 10
+  device: cuda
+
+validation:
+  enabled: true
+  split_ratio: 0.2
+  seed: 42
+  threshold: 0.5
+
+early_stopping:
+  enabled: true
+  monitor: val_f1
+  mode: max
+  patience: 8
+  min_delta: 0.0005
+  save_best: true
+  best_checkpoint_path: checkpoints/best_model.pt
+
+inference:
+  device: cuda

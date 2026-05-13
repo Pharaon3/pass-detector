@@ -44,7 +44,7 @@ postprocess:
 # Half-width in frames when stamping positives around each annotated event time.
 label_radius_frames:
   default: 10
-  pass: 13
+  pass: 7
 
 # strict_labels applies only to events retained after filtering to class_names.
 strict_labels: true

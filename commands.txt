@@ -17,6 +17,9 @@ CUDA_VISIBLE_DEVICES=0 python3 infer.py \
 --checkpoint "./checkpoints/pass.pt" \
 --output "./predictions.json"
 
+# Compare predictions to label JSON (same class, |Δt| < 1s; mean confidence)
+python3 score_events.py --predicted ./predictions.json --ground-truth "./dataset/private/495678ea48ae40cc957bbe03974dbf/495678ea48ae40cc957bbe03974dbf.json" --gt-classes pass
+
 cd ssh/
 ssh -i temporary.pem ubuntu@94.101.98.189
 cd soccernet/Video-classification--action-spotting-model/

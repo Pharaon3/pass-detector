@@ -19,8 +19,9 @@ using the current ``--config`` (learning rate, data paths, etc.); only weights a
 optimizer buffers are restored from the file.
 
 Validation / early stopping: see ``validation`` and ``early_stopping`` in ``config.yaml``.
-When ``early_stopping.save_best`` is true, the best epoch (by ``monitor``) is written to
-``early_stopping.best_checkpoint_path`` in addition to per-epoch and ``last.pt`` checkpoints.
+When ``early_stopping.save_best`` is true, the best epoch (by any monitored metric when
+``monitors`` is set) is written to ``early_stopping.best_checkpoint_path`` in addition to
+per-epoch and ``last.pt`` checkpoints.
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ from dataset import SoccerClipDataset, discover_clip_items, parse_allowed_enviro
 from models.event_model import build_event_model
 from utils.checkpoint import load_checkpoint, prune_epoch_checkpoints, save_checkpoint
 from utils.dataset_video import load_stem_to_relpath
-from utils.early_stopping import EarlyStopping
+from utils.early_stopping import EarlyStoppingMulti, EarlyStopper, build_early_stopper
 from utils.label_stats import compute_auto_pos_weight_numpy
 
 
@@ -539,7 +540,7 @@ def main() -> None:
     if pos_weight_cpu is not None:
         _print_pos_weight_table(list(cfg["class_names"]), pos_weight_cpu)
 
-    early_stopper: Optional[EarlyStopping] = None
+    early_stopper: Optional[EarlyStopper] = None
     if early_stopping_requested and val_loader is None:
         print(
             "early_stopping.enabled is true but validation is disabled or no validation loader is "
@@ -548,12 +549,7 @@ def main() -> None:
             file=sys.stderr,
         )
     elif early_stopping_requested and val_loader is not None:
-        early_stopper = EarlyStopping(
-            monitor=str(es_cfg["monitor"]),
-            mode=str(es_cfg["mode"]),
-            patience=int(es_cfg["patience"]),
-            min_delta=float(es_cfg["min_delta"]),
-        )
+        early_stopper = build_early_stopper(es_cfg)
 
     model = build_event_model(cfg).to(device)
 
@@ -635,47 +631,104 @@ def main() -> None:
             print(f"Epoch {epoch} mean_train_loss {avg_loss:.4f}")
 
         if early_stopper is not None and val_metrics is not None:
-            prev_best = early_stopper.best
-            should_stop, improved = early_stopper.step(val_metrics)
-            mon = str(es_cfg["monitor"])
-            cur = float(val_metrics[mon])
-            if improved:
-                save_best = bool(es_cfg.get("save_best", True))
-                if prev_best is None:
-                    trend = f"{mon} reached {cur:.4f} (new best)"
-                else:
-                    trend = f"{mon} improved from {prev_best:.4f} to {cur:.4f}"
-                extra_save = ""
-                if save_best:
-                    best_path = Path(es_cfg["best_checkpoint_path"])
-                    best_path.parent.mkdir(parents=True, exist_ok=True)
-                    save_checkpoint(
-                        best_path,
-                        model_state=model.state_dict(),
-                        optimizer_state=optimizer.state_dict(),
-                        epoch=epoch,
-                        config=cfg,
-                        extra={
-                            "best_metric": float(early_stopper.best),
-                            "monitor": mon,
-                        },
+            patience = int(es_cfg["patience"])
+            save_best = bool(es_cfg.get("save_best", True))
+
+            if isinstance(early_stopper, EarlyStoppingMulti):
+                should_stop, improved, improved_names = early_stopper.step(val_metrics)
+                if improved:
+                    parts = [
+                        f"{n}={float(val_metrics[n]):.4f}"
+                        for n in improved_names
+                    ]
+                    trend = (
+                        f"improved: {', '.join(parts)} | bests "
+                        + ", ".join(
+                            f"{n}={float(early_stopper.bests[n]):.4f}"
+                            for n, _ in early_stopper.monitors
+                            if early_stopper.bests.get(n) is not None
+                        )
                     )
-                    extra_save = f" Saving best checkpoint to {best_path}"
-                print(f"EarlyStopping: {trend}.{extra_save}")
+                    extra_save = ""
+                    if save_best:
+                        best_path = Path(es_cfg["best_checkpoint_path"])
+                        best_path.parent.mkdir(parents=True, exist_ok=True)
+                        save_checkpoint(
+                            best_path,
+                            model_state=model.state_dict(),
+                            optimizer_state=optimizer.state_dict(),
+                            epoch=epoch,
+                            config=cfg,
+                            extra={
+                                "best_metrics": {
+                                    k: float(v)
+                                    for k, v in early_stopper.bests.items()
+                                    if v is not None
+                                },
+                                "monitors": [
+                                    {"metric": n, "mode": m} for n, m in early_stopper.monitors
+                                ],
+                            },
+                        )
+                        extra_save = f" Saving best checkpoint to {best_path}"
+                    print(f"EarlyStopping: {trend}.{extra_save}")
+                else:
+                    nb = early_stopper.epochs_without_improvement
+                    bests_str = ", ".join(
+                        f"{n}={float(early_stopper.bests[n]):.4f}"
+                        for n, _ in early_stopper.monitors
+                        if early_stopper.bests.get(n) is not None
+                    )
+                    print(
+                        f"EarlyStopping: no improvement in any monitored metric for {nb}/{patience} epochs. "
+                        f"Bests: {bests_str}"
+                    )
+                if should_stop:
+                    print(
+                        f"EarlyStopping triggered at epoch {epoch}. "
+                        f"Bests: {', '.join(f'{n}={float(early_stopper.bests[n]):.4f}' for n, _ in early_stopper.monitors if early_stopper.bests.get(n) is not None)}"
+                    )
+                    stop_early = True
             else:
-                nb = early_stopper.epochs_without_improvement
-                patience = int(es_cfg["patience"])
-                best_v = float(early_stopper.best) if early_stopper.best is not None else cur
-                print(
-                    f"EarlyStopping: no improvement in {mon} for {nb}/{patience} epochs. "
-                    f"Best {mon}: {best_v:.4f}"
-                )
-            if should_stop:
-                print(
-                    f"EarlyStopping triggered at epoch {epoch}. "
-                    f"Best {mon}: {float(early_stopper.best):.4f}"
-                )
-                stop_early = True
+                prev_best = early_stopper.best
+                should_stop, improved = early_stopper.step(val_metrics)
+                mon = str(es_cfg["monitor"])
+                cur = float(val_metrics[mon])
+                if improved:
+                    if prev_best is None:
+                        trend = f"{mon} reached {cur:.4f} (new best)"
+                    else:
+                        trend = f"{mon} improved from {prev_best:.4f} to {cur:.4f}"
+                    extra_save = ""
+                    if save_best:
+                        best_path = Path(es_cfg["best_checkpoint_path"])
+                        best_path.parent.mkdir(parents=True, exist_ok=True)
+                        save_checkpoint(
+                            best_path,
+                            model_state=model.state_dict(),
+                            optimizer_state=optimizer.state_dict(),
+                            epoch=epoch,
+                            config=cfg,
+                            extra={
+                                "best_metric": float(early_stopper.best),
+                                "monitor": mon,
+                            },
+                        )
+                        extra_save = f" Saving best checkpoint to {best_path}"
+                    print(f"EarlyStopping: {trend}.{extra_save}")
+                else:
+                    nb = early_stopper.epochs_without_improvement
+                    best_v = float(early_stopper.best) if early_stopper.best is not None else cur
+                    print(
+                        f"EarlyStopping: no improvement in {mon} for {nb}/{patience} epochs. "
+                        f"Best {mon}: {best_v:.4f}"
+                    )
+                if should_stop:
+                    print(
+                        f"EarlyStopping triggered at epoch {epoch}. "
+                        f"Best {mon}: {float(early_stopper.best):.4f}"
+                    )
+                    stop_early = True
 
         save_checkpoint(
             ckpt_dir / f"epoch_{epoch:03d}.pt",

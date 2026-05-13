@@ -100,10 +100,16 @@ validation:
   seed: 42
   threshold: 0.5
 
+# Stops after ``patience`` epochs with no improvement on **any** listed metric (OR logic).
+# ``min_delta`` applies to each metric separately.
+# Legacy single-metric form: set ``monitor`` / ``mode`` and omit ``monitors`` (see build_early_stopper).
 early_stopping:
   enabled: true
-  monitor: val_f1
-  mode: max
+  monitors:
+    - metric: val_f1
+      mode: max
+    - metric: val_loss
+      mode: min
   patience: 8
   min_delta: 0.0005
   save_best: true

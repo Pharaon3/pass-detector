@@ -13,8 +13,8 @@ CUDA_VISIBLE_DEVICES=0 python3 train.py --data_root dataset --split train.txt --
 
 =============Infer=====================
 CUDA_VISIBLE_DEVICES=0 python3 infer.py \
---video "./dataset/private/a5c2ba10499d4910b5fb3358d39f7c/a5c2ba10499d4910b5fb3358d39f7c.mp4" \
---checkpoint "./checkpoints/last.pt" \
+--video "./dataset/private/495678ea48ae40cc957bbe03974dbf/495678ea48ae40cc957bbe03974dbf.mp4" \
+--checkpoint "./checkpoints/pass.pt" \
 --output "./predictions.json"
 
 cd ssh/

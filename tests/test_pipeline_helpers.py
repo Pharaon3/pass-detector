@@ -7,7 +7,7 @@ import unittest
 import torch
 
 from postprocess import build_multilabel_postprocess_params, postprocess_clip, postprocess_config_from_cfg
-from utils.early_stopping import EarlyStopping
+from utils.early_stopping import EarlyStopping, EarlyStoppingMulti, build_early_stopper
 from utils.labels import (
     events_to_frame_labels,
     filter_events_to_config_classes,
@@ -90,6 +90,40 @@ class TestEarlyStopping(unittest.TestCase):
         es = EarlyStopping("val_f1", "max", patience=2, min_delta=0.0)
         with self.assertRaises(KeyError):
             es.step({"val_loss": 0.1})
+
+
+class TestEarlyStoppingMulti(unittest.TestCase):
+    def test_loss_improvement_resets_patience_when_f1_flat(self) -> None:
+        es = EarlyStoppingMulti(
+            [("val_f1", "max"), ("val_loss", "min")],
+            patience=2,
+            min_delta=0.01,
+        )
+        stop, imp, names = es.step({"val_f1": 0.2, "val_loss": 1.0})
+        self.assertFalse(stop)
+        self.assertTrue(imp)
+        self.assertEqual(set(names), {"val_f1", "val_loss"})
+        stop, imp, names = es.step({"val_f1": 0.2, "val_loss": 0.5})
+        self.assertFalse(stop)
+        self.assertTrue(imp)
+        self.assertEqual(names, ["val_loss"])
+        stop, imp, names = es.step({"val_f1": 0.2, "val_loss": 0.5})
+        self.assertFalse(stop)
+        self.assertFalse(imp)
+        self.assertEqual(names, [])
+        stop, imp, names = es.step({"val_f1": 0.2, "val_loss": 0.5})
+        self.assertTrue(stop)
+        self.assertFalse(imp)
+
+    def test_build_early_stopper_monitors(self) -> None:
+        es = build_early_stopper(
+            {
+                "patience": 1,
+                "min_delta": 0.0,
+                "monitors": [{"metric": "val_loss", "mode": "min"}],
+            }
+        )
+        self.assertIsInstance(es, EarlyStoppingMulti)
 
 
 class TestPostprocess(unittest.TestCase):

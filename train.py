@@ -72,8 +72,8 @@ DEFAULT_EARLY_STOPPING: Dict[str, Any] = {
     "enabled": True,
     "monitor": "val_f1",
     "mode": "max",
-    "patience": 8,
-    "min_delta": 0.0005,
+    "patience": 20,
+    "min_delta": 0.0001,
     "save_best": True,
     "best_checkpoint_path": "checkpoints/best_model.pt",
 }

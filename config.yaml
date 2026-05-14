@@ -104,7 +104,8 @@ validation:
   threshold: 0.5
 
 # Stops after ``patience`` epochs with no improvement on **any** listed metric (OR logic).
-# ``min_delta`` applies to each metric separately.
+# ``min_delta`` applies to each metric separately. Raise ``patience`` to allow longer runs
+# before stopping; lower ``min_delta`` to treat smaller metric gains as improvement.
 # Legacy single-metric form: set ``monitor`` / ``mode`` and omit ``monitors`` (see build_early_stopper).
 early_stopping:
   enabled: true
@@ -113,8 +114,8 @@ early_stopping:
       mode: max
     - metric: val_loss
       mode: min
-  patience: 8
-  min_delta: 0.0005
+  patience: 20
+  min_delta: 0.0001
   save_best: true
   best_checkpoint_path: checkpoints/best_model.pt
 

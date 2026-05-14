@@ -6,7 +6,15 @@ import unittest
 
 import torch
 
-from postprocess import build_multilabel_postprocess_params, postprocess_clip, postprocess_config_from_cfg
+import numpy as np
+
+from postprocess import (
+    MultilabelPostprocessParams,
+    build_multilabel_postprocess_params,
+    postprocess_clip,
+    postprocess_config_from_cfg,
+    postprocess_multilabel_advanced,
+)
 from utils.early_stopping import EarlyStopping, EarlyStoppingMulti, build_early_stopper
 from utils.labels import (
     events_to_frame_labels,
@@ -139,7 +147,7 @@ class TestPostprocess(unittest.TestCase):
             "min_event_gap_sec": 0.2,
             "postprocess": {
                 "smoothing": {"enabled": False, "window_frames": 5},
-                "peak_picking": {"enabled": True},
+                "peak_picking": {"enabled": True, "mode": "local_max"},
                 "thresholds": {"default": 0.2, "a": 0.1},
                 "min_gap_sec": {"default": 0.2},
                 "top_k_per_class": None,
@@ -149,6 +157,27 @@ class TestPostprocess(unittest.TestCase):
         ml = build_multilabel_postprocess_params(cfg)
         self.assertEqual(ml.thresholds[0], 0.1)
         self.assertEqual(ml.thresholds[1], 0.2)
+        self.assertEqual(ml.peak_picking_mode, "local_max")
+
+    def test_invalid_peak_picking_mode(self) -> None:
+        cfg = {
+            "fps": 25,
+            "num_frames": 750,
+            "num_classes": 2,
+            "class_names": ["a", "b"],
+            "multi_label": True,
+            "activation": "sigmoid",
+            "threshold": 0.2,
+            "min_event_gap_sec": 0.2,
+            "postprocess": {
+                "peak_picking": {"enabled": True, "mode": "typo"},
+                "thresholds": {"default": 0.2},
+                "min_gap_sec": {"default": 0.2},
+            },
+        }
+        with self.assertRaises(ValueError) as ctx:
+            build_multilabel_postprocess_params(cfg)
+        self.assertIn("peak_picking.mode", str(ctx.exception))
 
     def test_postprocess_clip_end_to_end(self) -> None:
         cfg = {
@@ -166,6 +195,28 @@ class TestPostprocess(unittest.TestCase):
         logits[0, 2, 0] = 5.0
         ev = postprocess_clip(logits, pp)
         self.assertTrue(any(e["event"] == "a" for e in ev))
+
+    def test_plateau_mid_single_run(self) -> None:
+        """Plateau L..R: i_out = (argmax_index + (L+R)//2) // 2; one candidate per run."""
+        probs = np.zeros((20, 1), dtype=np.float64)
+        probs[10:15, 0] = 0.9
+        params = MultilabelPostprocessParams(
+            fps=10.0,
+            class_names=["pass"],
+            thresholds=[0.5],
+            min_gap_frames=[1],
+            smoothing_enabled=False,
+            smoothing_window_frames=1,
+            peak_picking_enabled=True,
+            peak_picking_mode="plateau_mid",
+            top_k_per_class=None,
+            top_k_total=None,
+        )
+        ev = postprocess_multilabel_advanced(probs, params)
+        self.assertEqual(len(ev), 1)
+        # L=10,R=14 -> i_mid=12, i_top=10 -> i_out=11
+        self.assertEqual(ev[0]["frame"], 11)
+        self.assertAlmostEqual(ev[0]["confidence"], 0.9)
 
 
 if __name__ == "__main__":

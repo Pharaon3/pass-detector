@@ -31,8 +31,9 @@ class MultilabelPostprocessParams:
     smoothing_enabled: bool
     smoothing_window_frames: int
     peak_picking_enabled: bool
-    top_k_per_class: Optional[List[Optional[int]]]
-    top_k_total: Optional[int]
+    peak_picking_mode: str = "local_max"
+    top_k_per_class: Optional[List[Optional[int]]] = None
+    top_k_total: Optional[int] = None
 
 
 @dataclass
@@ -139,6 +140,11 @@ def build_multilabel_postprocess_params(cfg: Dict[str, Any]) -> MultilabelPostpr
         smoothing_enabled = bool(sm.get("enabled", False))
         smoothing_window = int(sm.get("window_frames", 5))
         peak_enabled = bool(pk.get("enabled", False))
+        peak_mode = str(pk.get("mode", "local_max")).strip().lower()
+        if peak_mode not in ("local_max", "plateau_mid"):
+            raise ValueError(
+                f'postprocess.peak_picking.mode must be "local_max" or "plateau_mid", got {peak_mode!r}'
+            )
         top_k_pc = resolve_optional_topk_per_class(pp.get("top_k_per_class"), class_names)
         top_k_tot = pp.get("top_k_total")
         top_k_total = int(top_k_tot) if top_k_tot is not None else None
@@ -148,6 +154,7 @@ def build_multilabel_postprocess_params(cfg: Dict[str, Any]) -> MultilabelPostpr
         smoothing_enabled = False
         smoothing_window = 5
         peak_enabled = False
+        peak_mode = "local_max"
         top_k_pc = None
         top_k_total = None
 
@@ -163,6 +170,7 @@ def build_multilabel_postprocess_params(cfg: Dict[str, Any]) -> MultilabelPostpr
         smoothing_enabled=smoothing_enabled,
         smoothing_window_frames=max(1, smoothing_window),
         peak_picking_enabled=peak_enabled,
+        peak_picking_mode=peak_mode,
         top_k_per_class=top_k_pc,
         top_k_total=top_k_total,
     )
@@ -211,6 +219,52 @@ def local_peak_mask_1d(col: np.ndarray) -> np.ndarray:
         m[i] = col[i] >= col[i - 1] and col[i] >= col[i + 1]
     m[t - 1] = col[t - 1] >= col[t - 2]
     return m
+
+
+def plateau_mid_candidates_for_class(
+    col: np.ndarray,
+    threshold: float,
+    fps: float,
+    class_name: str,
+) -> List[Dict[str, Any]]:
+    """
+    One candidate per maximal contiguous run with ``col >= threshold``.
+
+    For each run ``[L, R]`` inclusive:
+      ``i_top`` = frame of first global maximum of ``col`` on that run,
+      ``i_mid`` = temporal midpoint ``(L + R) // 2``,
+      output frame ``(i_top + i_mid) // 2`` (integer middle of those two indices).
+
+    ``confidence`` is the maximum probability on the run (for ranking / NMS).
+    """
+    col = np.asarray(col, dtype=np.float64)
+    t = int(col.shape[0])
+    th = float(threshold)
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < t:
+        if float(col[i]) < th:
+            i += 1
+            continue
+        L = i
+        while i < t and float(col[i]) >= th:
+            i += 1
+        R = i - 1
+        seg = col[L : R + 1]
+        rel_top = int(np.argmax(seg))
+        i_top = L + rel_top
+        i_mid = (L + R) // 2
+        i_out = (i_top + i_mid) // 2
+        p_max = float(np.max(seg))
+        out.append(
+            {
+                "frame": int(i_out),
+                "time": int(i_out) / float(fps),
+                "event": class_name,
+                "confidence": p_max,
+            }
+        )
+    return out
 
 
 def _nms_per_class_gaps(
@@ -287,6 +341,7 @@ def postprocess_multilabel(
         smoothing_enabled=False,
         smoothing_window_frames=1,
         peak_picking_enabled=False,
+        peak_picking_mode="local_max",
         top_k_per_class=None,
         top_k_total=None,
     )
@@ -306,6 +361,11 @@ def postprocess_multilabel_advanced(
     for ci in range(c):
         col = arr[:, ci]
         th = float(params.thresholds[ci])
+        name = params.class_names[ci]
+        mode = str(getattr(params, "peak_picking_mode", "local_max")).strip().lower()
+        if params.peak_picking_enabled and mode == "plateau_mid":
+            candidates.extend(plateau_mid_candidates_for_class(col, th, params.fps, name))
+            continue
         peaks = local_peak_mask_1d(col) if params.peak_picking_enabled else np.ones(t, dtype=bool)
         for fi in range(t):
             if not peaks[fi]:
@@ -317,7 +377,7 @@ def postprocess_multilabel_advanced(
                 {
                     "frame": fi,
                     "time": fi / params.fps,
-                    "event": params.class_names[ci],
+                    "event": name,
                     "confidence": p,
                 }
             )

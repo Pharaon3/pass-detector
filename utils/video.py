@@ -174,3 +174,31 @@ def preprocess_clip_to_tensor(
     if device is not None:
         batch = batch.to(device)
     return batch
+
+
+def imagenet_black_normalized(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """RGB (0,0,0) in [0,1] after ImageNet mean/std normalization. Shape [3, 1, 1]."""
+    mean = IMAGENET_MEAN.to(device=device, dtype=dtype).view(3, 1, 1)
+    std = IMAGENET_STD.to(device=device, dtype=dtype).view(3, 1, 1)
+    return (-mean / std)
+
+
+def apply_temporal_blackout_last_half(clip_btchw: torch.Tensor) -> torch.Tensor:
+    """
+    Replace the temporal **second half** of a clip with normalized black frames.
+
+    ``clip_btchw`` is ``[B, T, 3, H, W]`` in ImageNet-normalized space (as from
+    ``preprocess_clip_to_tensor`` + ``unsqueeze(0)``). Frames ``T//2 .. T-1`` are set to black.
+    """
+    if clip_btchw.dim() != 5:
+        raise ValueError(f"Expected [B,T,3,H,W], got shape {tuple(clip_btchw.shape)}")
+    b, t, c, h, w = clip_btchw.shape
+    if c != 3:
+        raise ValueError(f"Expected 3 RGB channels, got {c}")
+    cut = t // 2
+    if cut >= t:
+        return clip_btchw
+    out = clip_btchw.clone()
+    blk = imagenet_black_normalized(out.device, out.dtype).view(1, 1, 3, 1, 1).expand(b, t - cut, 3, h, w)
+    out[:, cut:, :, :, :] = blk
+    return out

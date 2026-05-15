@@ -7,9 +7,15 @@ and the same train/val split as training when ``validation.enabled`` is true
 (``validation.split_ratio``, ``validation.seed``).
 
 Outputs:
-  - ``<output_dir>/predictions/<stem>.json`` — one prediction list per clip (if --save-predictions)
-  - ``<output_dir>/predictions/<stem>.confidence.json`` — per-frame class probs (if --export-confidence-sequences)
-  - ``<output_dir>/per_clip.jsonl`` — one JSON object per line with scores per stem
+  - ``<output_dir>/predictions/<stem>.json`` — postprocessed prediction list per clip (if --save-predictions
+    and not ``--export-confidence-sequences``). With ``--export-confidence-sequences``, this file is a
+    **copy of the clip's label JSON** (training annotations), not model events.
+  - ``<output_dir>/predictions/<stem>.confidence.json`` — per-frame class probs for the full clip (if
+    ``--export-confidence-sequences``); includes ``input_variant: full``.
+  - ``<output_dir>/predictions/<stem>.half_black.json`` — same label JSON copy for the half-black input run.
+  - ``<output_dir>/predictions/<stem>.half_black.confidence.json`` — probs when the temporal **second half**
+    of the clip tensor is replaced with black (normalized) before inference.
+  - ``<output_dir>/per_clip.jsonl`` — one JSON object per line with scores per stem (scoring uses full-clip preds).
   - ``<output_dir>/summary.json`` — rolled-up totals and optional by-split breakdown
 
 Shows a tqdm clip progress bar by default (``pip install tqdm``). Use ``--no-progress-bar`` to disable.
@@ -30,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -57,7 +64,11 @@ from score_events import (
 )
 from utils.checkpoint import load_checkpoint
 from utils.dataset_video import load_stem_to_relpath
-from utils.video import VideoPreprocessConfig, preprocess_clip_to_tensor
+from utils.video import (
+    VideoPreprocessConfig,
+    apply_temporal_blackout_last_half,
+    preprocess_clip_to_tensor,
+)
 
 _DEFAULT_VALIDATION: Dict[str, Any] = {
     "enabled": True,
@@ -125,8 +136,11 @@ def _infer_one_clip(
     *,
     export_frame_confidence: bool = False,
     prob_decimals: int = 6,
+    blackout_last_half: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     clip = preprocess_clip_to_tensor(str(video_path), vpre, device=device).unsqueeze(0)
+    if blackout_last_half:
+        clip = apply_temporal_blackout_last_half(clip)
     with torch.inference_mode():
         logits = model(clip)
     events = postprocess_clip(logits, pp_cfg)
@@ -214,8 +228,10 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Also write predictions/<stem>.confidence.json per clip: per-frame class probabilities "
-            "(schema per_frame_class_probs_v1; same activation as postprocess)."
+            "Write per-frame class probabilities: predictions/<stem>.confidence.json (full clip) and "
+            "<stem>.half_black.confidence.json (second half of clip tensor replaced with black). "
+            "Does not write postprocessed prediction events JSON; copies the clip's label JSON to "
+            "<stem>.json and <stem>.half_black.json instead. Scoring still uses full-clip model events."
         ),
     )
     parser.add_argument(
@@ -305,7 +321,7 @@ def main() -> None:
 
     out_root = Path(args.output_dir)
     pred_dir = out_root / "predictions"
-    if args.save_predictions:
+    if args.save_predictions or bool(args.export_confidence_sequences):
         pred_dir.mkdir(parents=True, exist_ok=True)
     out_root.mkdir(parents=True, exist_ok=True)
     jsonl_path = out_root / "per_clip.jsonl"
@@ -388,6 +404,7 @@ def main() -> None:
                         float(cfg["fps"]),
                         export_frame_confidence=bool(args.export_confidence_sequences),
                         prob_decimals=int(args.confidence_decimals),
+                        blackout_last_half=False,
                     )
                 except Exception as exc:  # pragma: no cover
                     row = {
@@ -405,21 +422,55 @@ def main() -> None:
                         print(msg, file=sys.stderr)
                     continue
 
-                if args.save_predictions:
+                exp_conf = bool(args.export_confidence_sequences)
+
+                if exp_conf:
                     pred_dir.mkdir(parents=True, exist_ok=True)
-                    pj = pred_dir / f"{stem}.json"
-                    pj.write_text(
+                    shutil.copy2(lp, pred_dir / f"{stem}.json")
+                elif args.save_predictions:
+                    pred_dir.mkdir(parents=True, exist_ok=True)
+                    (pred_dir / f"{stem}.json").write_text(
                         json.dumps(events, indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
 
                 if conf_obj is not None:
                     pred_dir.mkdir(parents=True, exist_ok=True)
-                    cj = pred_dir / f"{stem}.confidence.json"
-                    cj.write_text(
-                        json.dumps(conf_obj, indent=2, ensure_ascii=False),
+                    full_d = {**conf_obj, "input_variant": "full"}
+                    (pred_dir / f"{stem}.confidence.json").write_text(
+                        json.dumps(full_d, indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
+
+                if exp_conf:
+                    try:
+                        _, conf_half = _infer_one_clip(
+                            model,
+                            device,
+                            vpre,
+                            pp_cfg,
+                            activation,
+                            vp,
+                            list(cfg["class_names"]),
+                            float(cfg["fps"]),
+                            export_frame_confidence=True,
+                            prob_decimals=int(args.confidence_decimals),
+                            blackout_last_half=True,
+                        )
+                        pred_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(lp, pred_dir / f"{stem}.half_black.json")
+                        if conf_half is not None:
+                            half_d = {**conf_half, "input_variant": "half_black_last_temporal"}
+                            (pred_dir / f"{stem}.half_black.confidence.json").write_text(
+                                json.dumps(half_d, indent=2, ensure_ascii=False),
+                                encoding="utf-8",
+                            )
+                    except Exception as exc_half:  # pragma: no cover
+                        msg = f"WARN {stem} half_black infer: {exc_half}"
+                        if use_pbar:
+                            tqdm_auto.write(msg, file=sys.stderr)
+                        else:
+                            print(msg, file=sys.stderr)
 
                 gt_events = load_ground_truth_events(lp)
                 res = match_prediction_to_gt(

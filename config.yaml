@@ -34,7 +34,7 @@ postprocess:
     enabled: true
     # local_max: legacy local maxima. plateau_mid: one event per >=threshold run;
     # frame = midpoint between argmax-in-run and run temporal center.
-    mode: plateau_mid
+    mode: local_max
   thresholds:
     default: 0.5
     pass: 0.8

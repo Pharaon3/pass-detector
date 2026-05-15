@@ -11,6 +11,7 @@ import numpy as np
 from postprocess import (
     MultilabelPostprocessParams,
     build_multilabel_postprocess_params,
+    frame_confidence_export,
     postprocess_clip,
     postprocess_config_from_cfg,
     postprocess_multilabel_advanced,
@@ -217,6 +218,17 @@ class TestPostprocess(unittest.TestCase):
         # L=10,R=14 -> i_mid=12, i_top=10 -> i_out=11
         self.assertEqual(ev[0]["frame"], 11)
         self.assertAlmostEqual(ev[0]["confidence"], 0.9)
+
+    def test_frame_confidence_export(self) -> None:
+        logits = torch.zeros((1, 5, 1))
+        logits[0, 2, 0] = 8.0
+        d = frame_confidence_export(logits, "sigmoid", ["pass"], fps=10.0, prob_decimals=4)
+        self.assertEqual(d["schema"], "per_frame_class_probs_v1")
+        self.assertEqual(d["num_frames"], 5)
+        self.assertEqual(d["class_names"], ["pass"])
+        self.assertEqual(len(d["probs"]), 5)
+        self.assertEqual(len(d["probs"][0]), 1)
+        self.assertGreater(d["probs"][2][0], 0.99)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,50 @@ def logits_to_probs(logits: torch.Tensor, activation: str) -> torch.Tensor:
     raise ValueError(f"Unknown activation: {activation}")
 
 
+def frame_confidence_export(
+    logits: torch.Tensor,
+    activation: str,
+    class_names: Sequence[str],
+    fps: float,
+    *,
+    multilabel: Optional[MultilabelPostprocessParams] = None,
+    prob_decimals: int = 6,
+) -> Dict[str, Any]:
+    """
+    Build a JSON-serializable dict: per-frame probabilities after ``activation``.
+
+    ``logits`` is ``[1, T, C]`` or ``[T, C]``. Output ``probs`` is length ``T``;
+    each entry is length ``C`` aligned with ``class_names`` (same order as the model).
+
+    When ``multilabel`` is set and smoothing is enabled in params, applies the same
+    temporal moving average as ``postprocess_multilabel_advanced`` (so curves match
+    the event pipeline input). Peak picking / thresholds are not applied here.
+    """
+    probs = logits_to_probs(logits, activation)
+    arr = probs.detach().float().cpu().numpy()
+    if multilabel is not None and multilabel.smoothing_enabled and multilabel.smoothing_window_frames > 1:
+        arr = temporal_moving_average_probs(arr, multilabel.smoothing_window_frames)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    t, c = int(arr.shape[0]), int(arr.shape[1])
+    if c != len(class_names):
+        raise ValueError(
+            f"Logits classes {c} != len(class_names) {len(class_names)} "
+            f"(class_names={list(class_names)!r})"
+        )
+    nd = max(0, int(prob_decimals))
+    rows: List[List[float]] = []
+    for fi in range(t):
+        rows.append([round(float(arr[fi, ci]), nd) for ci in range(c)])
+    return {
+        "schema": "per_frame_class_probs_v1",
+        "fps": float(fps),
+        "num_frames": t,
+        "class_names": list(class_names),
+        "probs": rows,
+    }
+
+
 def resolve_per_class_float(
     value: Union[int, float, Dict[str, Any]],
     class_names: Sequence[str],

@@ -1,6 +1,9 @@
 """
 Run event detection on a single video clip and write JSON predictions.
 
+Optional: ``--confidence-output`` writes a second JSON with per-frame class probabilities
+(same activation as training: sigmoid or softmax), schema ``per_frame_class_probs_v1``.
+
 Config: weights and architecture come from the checkpoint. If --config is
 omitted, threshold / activation / multi_label / min_event_gap_sec / postprocess
 are merged from ./config.yaml when present so tuning edits apply without retraining.
@@ -23,7 +26,12 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 from models.event_model import build_event_model
-from postprocess import logits_to_probs, postprocess_clip, postprocess_config_from_cfg
+from postprocess import (
+    frame_confidence_export,
+    logits_to_probs,
+    postprocess_clip,
+    postprocess_config_from_cfg,
+)
 from utils.checkpoint import load_checkpoint
 from utils.video import VideoPreprocessConfig, preprocess_clip_to_tensor
 
@@ -38,6 +46,21 @@ def main() -> None:
     parser.add_argument("--video", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, required=True)
+    parser.add_argument(
+        "--confidence-output",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON path for per-frame class probabilities "
+            "(schema per_frame_class_probs_v1: fps, num_frames, class_names, probs[T][C])."
+        ),
+    )
+    parser.add_argument(
+        "--confidence-decimals",
+        type=int,
+        default=6,
+        help="Decimal places for floats in --confidence-output (default: 6).",
+    )
     parser.add_argument(
         "--config",
         type=str,
@@ -135,6 +158,21 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(events, f, indent=2)
+
+    if args.confidence_output:
+        conf_path = Path(args.confidence_output)
+        conf_path.parent.mkdir(parents=True, exist_ok=True)
+        conf_obj = frame_confidence_export(
+            logits,
+            activation,
+            cfg["class_names"],
+            float(cfg["fps"]),
+            multilabel=pp_cfg.multilabel if pp_cfg.multi_label else None,
+            prob_decimals=max(0, int(args.confidence_decimals)),
+        )
+        with conf_path.open("w", encoding="utf-8") as f:
+            json.dump(conf_obj, f, indent=2)
+        print(f"Wrote frame confidence ({conf_obj['num_frames']} x {len(conf_obj['class_names'])}) to {conf_path.resolve()}")
 
     print(f"Wrote {len(events)} events to {out_path.resolve()}")
 

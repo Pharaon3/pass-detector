@@ -8,6 +8,7 @@ and the same train/val split as training when ``validation.enabled`` is true
 
 Outputs:
   - ``<output_dir>/predictions/<stem>.json`` — one prediction list per clip (if --save-predictions)
+  - ``<output_dir>/predictions/<stem>.confidence.json`` — per-frame class probs (if --export-confidence-sequences)
   - ``<output_dir>/per_clip.jsonl`` — one JSON object per line with scores per stem
   - ``<output_dir>/summary.json`` — rolled-up totals and optional by-split breakdown
 
@@ -48,7 +49,7 @@ if str(_PKG) not in sys.path:
 
 from dataset import discover_clip_items, parse_allowed_environments
 from models.event_model import build_event_model
-from postprocess import postprocess_clip, postprocess_config_from_cfg
+from postprocess import frame_confidence_export, postprocess_clip, postprocess_config_from_cfg
 from score_events import (
     _normalize_gt_event,
     load_ground_truth_events,
@@ -119,7 +120,12 @@ def _infer_one_clip(
     pp_cfg: Any,
     activation: str,
     video_path: Path,
-) -> List[Dict[str, Any]]:
+    class_names: List[str],
+    fps: float,
+    *,
+    export_frame_confidence: bool = False,
+    prob_decimals: int = 6,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     clip = preprocess_clip_to_tensor(str(video_path), vpre, device=device).unsqueeze(0)
     with torch.inference_mode():
         logits = model(clip)
@@ -127,7 +133,17 @@ def _infer_one_clip(
     for e in events:
         e["time"] = round(float(e["time"]), 4)
         e["confidence"] = round(float(e["confidence"]), 4)
-    return events
+    conf_obj: Optional[Dict[str, Any]] = None
+    if export_frame_confidence:
+        conf_obj = frame_confidence_export(
+            logits,
+            activation,
+            class_names,
+            fps,
+            multilabel=pp_cfg.multilabel if pp_cfg.multi_label else None,
+            prob_decimals=max(0, int(prob_decimals)),
+        )
+    return events, conf_obj
 
 
 def main() -> None:
@@ -188,10 +204,19 @@ def main() -> None:
         help="Only score these GT classes (e.g. pass). Recommended for pass-only models.",
     )
     parser.add_argument(
-        "--save-predictions",
+        "--export-confidence-sequences",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Write predictions/<stem>.json per clip (default: true).",
+        default=False,
+        help=(
+            "Also write predictions/<stem>.confidence.json per clip: per-frame class probabilities "
+            "(schema per_frame_class_probs_v1; same activation as postprocess)."
+        ),
+    )
+    parser.add_argument(
+        "--confidence-decimals",
+        type=int,
+        default=6,
+        help="Decimal places for floats in *.confidence.json (default: 6).",
     )
     parser.add_argument(
         "--device",
@@ -346,7 +371,18 @@ def main() -> None:
             for stem, split_tag in iterator:
                 vp, lp = stem_to_paths[stem]
                 try:
-                    events = _infer_one_clip(model, device, vpre, pp_cfg, activation, vp)
+                    events, conf_obj = _infer_one_clip(
+                        model,
+                        device,
+                        vpre,
+                        pp_cfg,
+                        activation,
+                        vp,
+                        list(cfg["class_names"]),
+                        float(cfg["fps"]),
+                        export_frame_confidence=bool(args.export_confidence_sequences),
+                        prob_decimals=int(args.confidence_decimals),
+                    )
                 except Exception as exc:  # pragma: no cover
                     row = {
                         "stem": stem,
@@ -364,9 +400,18 @@ def main() -> None:
                     continue
 
                 if args.save_predictions:
+                    pred_dir.mkdir(parents=True, exist_ok=True)
                     pj = pred_dir / f"{stem}.json"
                     pj.write_text(
                         json.dumps(events, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+
+                if conf_obj is not None:
+                    pred_dir.mkdir(parents=True, exist_ok=True)
+                    cj = pred_dir / f"{stem}.confidence.json"
+                    cj.write_text(
+                        json.dumps(conf_obj, indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
 

@@ -204,6 +204,12 @@ def main() -> None:
         help="Only score these GT classes (e.g. pass). Recommended for pass-only models.",
     )
     parser.add_argument(
+        "--save-predictions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write predictions/<stem>.json per clip (default: true). Use --no-save-predictions to skip.",
+    )
+    parser.add_argument(
         "--export-confidence-sequences",
         action=argparse.BooleanOptionalAction,
         default=False,

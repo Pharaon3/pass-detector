@@ -27,7 +27,7 @@ python3 score_events.py --predicted ./predictions.json --ground-truth "./dataset
 python3 batch_infer_and_score.py --data_root dataset/private --video_dir . --labels_dir . --checkpoint ./checkpoints/best_model.pt --output-dir ./analyze_train --which train --gt-classes pass
 # Same + per-frame probs: predictions/<stem>.confidence.json
 python3 batch_infer_and_score.py --data_root dataset/private --video_dir . --labels_dir . --checkpoint ./checkpoints/best_model.pt --output-dir ./analyze_conf --which train --gt-classes pass --export-confidence-sequences
-python3 batch_infer_and_score.py --data_root dataset/private --video_dir . --labels_dir . --checkpoint ./checkpoints/best_model.pt --output-dir ./analyze_val   --which val   --gt-classes pass
+python3 batch_infer_and_score.py --data_root dataset/private --video_dir . --labels_dir . --checkpoint ./checkpoints/best_model.pt --output-dir ./analyze_val   --which val   --gt-classes pass --export-confidence-sequences
 python3 batch_infer_and_score.py --data_root dataset/private --video_dir . --labels_dir . --checkpoint ./checkpoints/best_model.pt --output-dir ./analyze_all   --which all   --gt-classes pass
 
 cd ssh/

@@ -1,10 +1,13 @@
 """
-Train temporal stack + prediction head on fixed-length clips.
+Train temporal stack + prediction head on video clips.
 
 Feature extractor is frozen by default (config: freeze_feature_extractor).
 
 Data: clips are loaded in batches (training.batch_size). Each optimizer step
-processes one batch of up to batch_size videos stacked as [B,T,3,H,W].
+processes one batch stacked as [B,T,3,H,W]. With ``training_clip_mode: pass_centric``,
+``T`` is the max native window length in the batch (short clips padded with normalized black;
+``valid_mask`` excludes pads from loss). With ``full_clip``, ``T`` is always ``num_frames``
+(e.g. 750). Inference still uses full ``num_frames`` clips (see ``infer.py``).
 
 Logging: training.log_each_step (default true) logs loss and video paths
 after every batch. Set log_each_step: false and tune log_every for sparser logs.
@@ -59,6 +62,7 @@ from utils.checkpoint import load_checkpoint, prune_epoch_checkpoints, save_chec
 from utils.dataset_video import load_stem_to_relpath
 from utils.early_stopping import EarlyStoppingMulti, EarlyStopper, build_early_stopper
 from utils.label_stats import compute_auto_pos_weight_numpy
+from utils.video import imagenet_black_normalized
 
 
 DEFAULT_VALIDATION: Dict[str, Any] = {
@@ -85,10 +89,68 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 
 
 def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    videos = torch.stack([b["video"] for b in batch], dim=0)  # [B,T,3,H,W]
-    labels = torch.stack([b["labels"] for b in batch], dim=0)
     paths = [b["video_path"] for b in batch]
-    return {"video": videos, "labels": labels, "video_path": paths}
+    Ts = [int(b["video"].shape[0]) for b in batch]
+    T_m = max(Ts)
+    B = len(batch)
+    v0 = batch[0]["video"]
+    H, W = int(v0.shape[2]), int(v0.shape[3])
+    lab0 = batch[0]["labels"]
+    multi_dim2 = lab0.dim() == 2
+
+    if len(set(Ts)) == 1 and Ts[0] == T_m:
+        videos = torch.stack([b["video"] for b in batch], dim=0)
+        labels = torch.stack([b["labels"] for b in batch], dim=0)
+        valid_mask = torch.ones(B, T_m, dtype=torch.bool)
+        return {"video": videos, "labels": labels, "video_path": paths, "valid_mask": valid_mask}
+
+    dtype = v0.dtype
+    blk = imagenet_black_normalized(torch.device("cpu"), dtype).view(1, 1, 3, 1, 1)
+    videos = blk.expand(B, T_m, 3, H, W).clone()
+    valid_mask = torch.zeros(B, T_m, dtype=torch.bool)
+    if multi_dim2:
+        Cn = int(lab0.shape[1])
+        labels = torch.zeros(B, T_m, Cn, dtype=lab0.dtype)
+    else:
+        labels = torch.zeros(B, T_m, dtype=lab0.dtype)
+    for i, b in enumerate(batch):
+        t = int(b["video"].shape[0])
+        videos[i, :t] = b["video"]
+        labels[i, :t] = b["labels"]
+        valid_mask[i, :t] = True
+    return {"video": videos, "labels": labels, "video_path": paths, "valid_mask": valid_mask}
+
+
+def _masked_bce_with_logits(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    pos_weight: Optional[torch.Tensor],
+    valid_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if valid_mask is None:
+        if pos_weight is not None:
+            return F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight)
+        return F.binary_cross_entropy_with_logits(logits, y)
+    if pos_weight is not None:
+        pw = pos_weight.to(device=logits.device, dtype=logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pw, reduction="none")
+    else:
+        loss = F.binary_cross_entropy_with_logits(logits, y, reduction="none")
+    m = valid_mask.unsqueeze(-1).to(dtype=loss.dtype)
+    return (loss * m).sum() / m.sum().clamp(min=1.0)
+
+
+def _masked_cross_entropy(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    b, t, c = logits.shape
+    if valid_mask is None:
+        return F.cross_entropy(logits.view(-1, c), y.view(-1))
+    loss = F.cross_entropy(logits.view(-1, c), y.view(-1), reduction="none").view(b, t)
+    m = valid_mask.to(dtype=loss.dtype)
+    return (loss * m).sum() / m.sum().clamp(min=1.0)
 
 
 def _build_pos_weight_tensor(
@@ -194,17 +256,16 @@ def train_one_epoch(
         for step, batch in enumerate(iterator):
             x = batch["video"].to(device)
             y = batch["labels"].to(device)
+            valid_mask = batch.get("valid_mask")
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(x)  # [B,T,C]
 
             if multi_label:
-                if pos_weight is not None:
-                    pw = pos_weight.to(device=device, dtype=logits.dtype)
-                    loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pw)
-                else:
-                    loss = F.binary_cross_entropy_with_logits(logits, y)
+                loss = _masked_bce_with_logits(logits, y, pos_weight, valid_mask)
             else:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                loss = _masked_cross_entropy(logits, y, valid_mask)
 
             loss.backward()
             optimizer.step()
@@ -314,31 +375,37 @@ def validate_one_epoch(
             for batch in it:
                 x = batch["video"].to(device)
                 y = batch["labels"].to(device)
+                valid_mask = batch.get("valid_mask")
+                if valid_mask is not None:
+                    valid_mask = valid_mask.to(device)
                 logits = model(x)
 
                 if multi_label:
-                    if pos_weight is not None:
-                        pw = pos_weight.to(device=device, dtype=logits.dtype)
-                        loss_red = F.binary_cross_entropy_with_logits(
-                            logits, y, pos_weight=pw, reduction="sum"
-                        )
-                    else:
-                        loss_red = F.binary_cross_entropy_with_logits(
-                            logits, y, reduction="sum"
-                        )
-                    ne = logits.numel()
-                    sum_loss += float(loss_red.item())
-                    n_loss_elems += int(ne)
+                    pw = pos_weight.to(device=device, dtype=logits.dtype) if pos_weight is not None else None
+                    loss_mean = _masked_bce_with_logits(logits, y, pw, valid_mask)
+                    ne = (
+                        int(valid_mask.sum().item()) * int(logits.size(-1))
+                        if valid_mask is not None
+                        else int(logits.numel())
+                    )
+                    sum_loss += float(loss_mean.item()) * ne
+                    n_loss_elems += ne
 
                     probs = torch.sigmoid(logits)
                     pred = (probs >= float(threshold)).to(dtype=logits.dtype)
                     y_bin = y.to(dtype=logits.dtype)
-                else:
-                    loss_red = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)), y.view(-1), reduction="sum"
+                    m = (
+                        valid_mask.unsqueeze(-1).to(dtype=pred.dtype)
+                        if valid_mask is not None
+                        else 1.0
                     )
-                    n_el = int(y.numel())
-                    sum_loss += float(loss_red.item())
+                    tp_c += (pred * y_bin * m).sum(dim=(0, 1)).detach().cpu()
+                    fp_c += (pred * (1.0 - y_bin) * m).sum(dim=(0, 1)).detach().cpu()
+                    fn_c += ((1.0 - pred) * y_bin * m).sum(dim=(0, 1)).detach().cpu()
+                else:
+                    loss_mean = _masked_cross_entropy(logits, y, valid_mask)
+                    n_el = int(valid_mask.sum().item()) if valid_mask is not None else int(y.numel())
+                    sum_loss += float(loss_mean.item()) * n_el
                     n_loss_elems += n_el
 
                     pred_cls = logits.argmax(dim=-1)
@@ -348,10 +415,14 @@ def validate_one_epoch(
                     pred = F.one_hot(pred_cls.long().view(-1), num_classes).view_as(y_bin).to(
                         dtype=logits.dtype
                     )
-
-                tp_c += (pred * y_bin).sum(dim=(0, 1)).detach().cpu()
-                fp_c += (pred * (1.0 - y_bin)).sum(dim=(0, 1)).detach().cpu()
-                fn_c += ((1.0 - pred) * y_bin).sum(dim=(0, 1)).detach().cpu()
+                    m = (
+                        valid_mask.unsqueeze(-1).to(dtype=pred.dtype)
+                        if valid_mask is not None
+                        else 1.0
+                    )
+                    tp_c += (pred * y_bin * m).sum(dim=(0, 1)).detach().cpu()
+                    fp_c += (pred * (1.0 - y_bin) * m).sum(dim=(0, 1)).detach().cpu()
+                    fn_c += ((1.0 - pred) * y_bin * m).sum(dim=(0, 1)).detach().cpu()
 
     eps = 1.0e-8
     val_loss = sum_loss / max(n_loss_elems, 1)
@@ -540,6 +611,10 @@ def main() -> None:
         video_dir=args.video_dir,
         labels_dir=args.labels_dir,
         video_backend=backend,
+    )
+    print(
+        f"training_clip_mode: {cfg.get('training_clip_mode', 'full_clip')}  "
+        f"train dataset size (samples per epoch): {len(ds)}"
     )
     nw = int(cfg["training"].get("num_workers", 2))
     loader = DataLoader(

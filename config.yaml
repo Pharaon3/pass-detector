@@ -49,6 +49,12 @@ label_radius_frames:
   default: 10
   pass: 20
 
+# full_clip: one training step per video (whole num_frames window).
+# pass_centric: one step per annotated pass — native crop [pass - 2R, pass + 2R] (length ~4R+1
+# frames, no stretch to num_frames). Batches pad to max T with black; loss ignores pads.
+# Inference still uses full num_frames (e.g. 750) from infer / batch_infer.
+training_clip_mode: pass_centric
+
 # strict_labels applies only to events retained after filtering to class_names.
 strict_labels: true
 

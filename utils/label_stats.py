@@ -8,8 +8,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
-from dataset import discover_clip_items, parse_allowed_environments
+from dataset import (
+    build_pass_centric_schedule,
+    discover_clip_items,
+    parse_allowed_environments,
+    parse_training_clip_mode,
+    pass_centric_crop_indices,
+)
 from utils.dataset_video import load_stem_to_relpath
 from utils.labels import (
     build_class_to_idx,
@@ -53,8 +60,39 @@ def aggregate_frame_counts_from_json(
     )
 
     pos = np.zeros(num_classes, dtype=np.float64)
+    clip_mode = parse_training_clip_mode(cfg)
+
     if not multi_label:
-        # Per-class positive = frames assigned that class index
+        if clip_mode == "pass_centric":
+            samples = build_pass_centric_schedule(items, cfg)
+            y_cache: Dict[int, torch.Tensor] = {}
+            for ci in {s[0] for s in samples}:
+                _, lpath = items[ci]
+                events = filter_events_to_config_classes(
+                    load_events_json(lpath), class_to_idx
+                )
+                y_cache[ci] = events_to_frame_labels(
+                    events,
+                    class_to_idx,
+                    T,
+                    fps,
+                    multi_label,
+                    radius,
+                    strict_labels=strict,
+                    label_source=lpath,
+                )
+            sum_l = 0
+            for clip_idx, center, R in samples:
+                y_full = y_cache[clip_idx]
+                lo, hi = pass_centric_crop_indices(center, R, T, random_negative=(center < 0))
+                y_w = y_full[lo : hi + 1]
+                arr = y_w.numpy().astype(np.int64)
+                sum_l += int(arr.shape[0])
+                for c in range(num_classes):
+                    pos[c] += int(np.sum(arr == c))
+            neg = float(sum_l) - pos
+            return pos, neg, T, [p for _, p in items]
+
         for _, lpath in items:
             events = filter_events_to_config_classes(
                 load_events_json(lpath), class_to_idx
@@ -73,6 +111,34 @@ def aggregate_frame_counts_from_json(
             for c in range(num_classes):
                 pos[c] += int(np.sum(arr == c))
         neg = float(len(items) * T) - pos
+        return pos, neg, T, [p for _, p in items]
+
+    if clip_mode == "pass_centric":
+        samples = build_pass_centric_schedule(items, cfg)
+        y_cache: Dict[int, torch.Tensor] = {}
+        for ci in {s[0] for s in samples}:
+            _, lpath = items[ci]
+            events = filter_events_to_config_classes(
+                load_events_json(lpath), class_to_idx
+            )
+            y_cache[ci] = events_to_frame_labels(
+                events,
+                class_to_idx,
+                T,
+                fps,
+                True,
+                radius,
+                strict_labels=strict,
+                label_source=lpath,
+            )
+        sum_l = 0
+        for clip_idx, center, R in samples:
+            y_full = y_cache[clip_idx]
+            lo, hi = pass_centric_crop_indices(center, R, T, random_negative=(center < 0))
+            y_w = y_full[lo : hi + 1]
+            sum_l += int(y_w.shape[0])
+            pos += y_w.numpy().astype(np.float64).sum(axis=0)
+        neg = float(sum_l) - pos
         return pos, neg, T, [p for _, p in items]
 
     for _, lpath in items:

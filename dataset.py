@@ -10,10 +10,21 @@ Each clip is resized temporally to `num_frames` at `fps` (see utils.video).
 Frame targets are built via utils.labels.events_to_frame_labels on label events whose
 class is listed in config ``class_names`` (see utils.labels.filter_events_to_config_classes);
 other event types in the JSON files are ignored.
+
+Training scope (``training_clip_mode`` in config):
+  - ``full_clip`` (default): one dataset index per video; model sees the whole ``num_frames`` window
+    (e.g. 750). Inference uses the same length.
+  - ``pass_centric``: one index per annotated pass (plus one random window for clips with no pass).
+    Each sample is a **native-length** crop of model-time frames ``[pass - 2R, pass + 2R]``
+    (``R`` = ``label_radius_frames`` for that class), length ``4*R+1`` when unobstructed — **no**
+    temporal resampling. Batches pad shorter clips to ``max T`` in the batch with normalized black;
+    training / val loss uses ``valid_mask`` so padded frames are ignored. Inference still uses full
+    ``num_frames`` clips (unchanged in ``infer.py`` / ``batch_infer_and_score.py``).
 """
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import AbstractSet, Any, Dict, FrozenSet, List, Optional, Tuple
 
@@ -22,16 +33,96 @@ from torch.utils.data import Dataset
 
 from utils.dataset_video import VIDEO_EXTS, load_stem_to_relpath, resolve_clip_video_path
 from utils.labels import (
+    _event_class_name,
+    _event_time_seconds,
     build_class_to_idx,
     events_to_frame_labels,
     filter_events_to_config_classes,
     load_events_json,
     load_label_environment,
     parse_label_radius_frames,
+    radius_frames_for_class,
 )
 from utils.video import VideoPreprocessConfig, preprocess_clip_to_tensor
 
 _EXT_SET = frozenset(VIDEO_EXTS)
+
+
+def parse_training_clip_mode(cfg: Dict[str, Any]) -> str:
+    mode = str(cfg.get("training_clip_mode", "full_clip")).strip().lower()
+    if mode not in ("full_clip", "pass_centric"):
+        raise ValueError(
+            f'training_clip_mode must be "full_clip" or "pass_centric", got {mode!r}'
+        )
+    return mode
+
+
+def pass_centric_crop_indices(center: int, R: int, num_frames: int, *, random_negative: bool) -> Tuple[int, int]:
+    """
+    Inclusive ``[lo, hi]`` frame indices on the full clip timeline (0 .. num_frames-1).
+
+    For a pass at ``center`` use half-span ``2 * R`` each side (user: ``2 * label_radius_frames``).
+    For ``center == -1`` (no-pass clip) use a window of length ``min(num_frames, 4*R+1)``:
+    random start if ``random_negative`` else centered for deterministic stats.
+    """
+    T = int(num_frames)
+    if center < 0:
+        win = min(T, 4 * int(R) + 1)
+        if win >= T:
+            return 0, T - 1
+        if random_negative:
+            lo = random.randint(0, T - win)
+        else:
+            lo = max(0, (T - win) // 2)
+        return lo, lo + win - 1
+    half = 2 * int(R)
+    lo = max(0, int(center) - half)
+    hi = min(T - 1, int(center) + half)
+    if lo > hi:
+        return 0, T - 1
+    return lo, hi
+
+
+def build_pass_centric_schedule(
+    items: List[Tuple[Path, Path]],
+    cfg: Dict[str, Any],
+) -> List[Tuple[int, int, int]]:
+    """
+    One entry per training step for ``pass_centric`` mode.
+
+    Returns list of ``(clip_idx, center_frame, R)``:
+      - ``center_frame >= 0``: crop around that pass; ``R`` is that event class label radius.
+      - ``center_frame == -1``: clip has no in-config events; ``R`` is max class radius;
+        random temporal window at load time.
+    """
+    class_names: List[str] = list(cfg["class_names"])
+    class_to_idx = build_class_to_idx(class_names)
+    fps = int(cfg["fps"])
+    T = int(cfg["num_frames"])
+    radius_spec = parse_label_radius_frames(cfg.get("label_radius_frames", 10), class_names)
+    R_ref = max(radius_frames_for_class(n, radius_spec) for n in class_names)
+    schedule: List[Tuple[int, int, int]] = []
+    for i, (_, lpath) in enumerate(items):
+        events = filter_events_to_config_classes(load_events_json(lpath), class_to_idx)
+        per: List[Tuple[int, int]] = []
+        for ev in events:
+            try:
+                name = _event_class_name(ev)
+            except KeyError:
+                continue
+            if name not in class_to_idx:
+                continue
+            R = radius_frames_for_class(name, radius_spec)
+            t_sec = _event_time_seconds(ev)
+            c = int(round(t_sec * float(fps)))
+            c = max(0, min(T - 1, c))
+            per.append((c, R))
+        if not per:
+            schedule.append((i, -1, R_ref))
+        else:
+            for c, R in per:
+                schedule.append((i, c, R))
+    return schedule
 
 
 def parse_allowed_environments(config: Dict[str, Any]) -> Optional[FrozenSet[str]]:
@@ -220,6 +311,8 @@ class SoccerClipDataset(Dataset):
             config: loaded YAML dict (must include fps, num_frames, class_names, multi_label, ...)
             split: optional; if provided, expects `root/split.txt` listing basenames (one per line)
             stems: optional explicit list of basenames (same as split file lines). Mutually exclusive with split.
+
+        ``config['training_clip_mode']``: ``full_clip`` (default) or ``pass_centric`` (see module docstring).
         """
         self.root = Path(root)
         self.config = config
@@ -256,10 +349,48 @@ class SoccerClipDataset(Dataset):
             allowed_environments=allowed_env,
         )
 
+        self.training_clip_mode = parse_training_clip_mode(config)
+        self._pass_samples: Optional[List[Tuple[int, int, int]]] = None
+        if self.training_clip_mode == "pass_centric":
+            self._pass_samples = build_pass_centric_schedule(self.items, config)
+
     def __len__(self) -> int:
+        if self.training_clip_mode == "pass_centric":
+            return len(self._pass_samples or ())
         return len(self.items)
 
+    def _getitem_pass_centric(self, idx: int) -> Dict[str, Any]:
+        assert self._pass_samples is not None
+        clip_idx, center, R = self._pass_samples[idx]
+        vpath, lpath = self.items[clip_idx]
+        events = filter_events_to_config_classes(
+            load_events_json(lpath), self.class_to_idx
+        )
+        video = preprocess_clip_to_tensor(vpath, self.vpre, device=None)  # [T,3,H,W]
+        labels = events_to_frame_labels(
+            events,
+            self.class_to_idx,
+            self.num_frames,
+            self.fps,
+            self.multi_label,
+            self.label_radius_spec,
+            strict_labels=self.strict_labels,
+            label_source=lpath,
+        )
+        lo, hi = pass_centric_crop_indices(
+            center, R, self.num_frames, random_negative=(center < 0)
+        )
+        vid_w = video[lo : hi + 1]
+        lab_w = labels[lo : hi + 1]
+        return {
+            "video": vid_w,
+            "labels": lab_w,
+            "video_path": str(vpath),
+        }
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self.training_clip_mode == "pass_centric":
+            return self._getitem_pass_centric(idx)
         vpath, lpath = self.items[idx]
         events = filter_events_to_config_classes(
             load_events_json(lpath), self.class_to_idx
